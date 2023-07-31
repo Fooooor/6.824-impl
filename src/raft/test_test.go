@@ -128,6 +128,7 @@ func TestManyElections2A(t *testing.T) {
 func TestBasicAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
+	// time.Sleep(500 * time.Millisecond)
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2B): basic agreement")
