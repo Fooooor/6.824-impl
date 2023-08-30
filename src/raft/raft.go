@@ -228,6 +228,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		fmt.Println(rf.me, "当前任期大于请求任期，忽略请求")
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -236,32 +237,38 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.voteFor = -1
 		fmt.Println("更新信息")
 	}
-	rf.electionTimer.Reset(randomElectionTimeOut())
-	var lastLogTerm int
-	if len(rf.log) > 0 {
-		lastLogTerm = rf.log[rf.lastLogIndex()].TermId
-		if rf.lastLogIndex() < args.PrevLogIndex || lastLogTerm != args.PrevLogTerm {
-			reply.Success = false
-			return
-		}
+	if args.PrevLogIndex > rf.lastLogIndex() || args.PrevLogIndex > -1 && rf.log[args.PrevLogIndex].TermId != args.PrevLogTerm {
+		reply.Success = false
+		fmt.Println("日志不匹配")
 	}
+	rf.electionTimer.Reset(randomElectionTimeOut())
+	// var prevLogTerm int
+	// if len(rf.log) > 0 && args.PrevLogIndex > -1 {
+	// 	prevLogTerm = rf.log[args.PrevLogIndex].TermId
+	// 	if prevLogTerm > args.PrevLogTerm {
+	// 		reply.Success = false
+	// 		fmt.Println(rf.me, prevLogTerm, args.PrevLogTerm, "当前日志任期大于请求日志任期，忽略请求")
+	// 		return
+	// 	}
+	// }
 	//将收到的消息的日志写入自身
 	reply.Success = true
 	if len(args.Entries) > 0 {
 		//不匹配的日志需要被删除
-		if rf.lastLogIndex() > 0 && args.PrevLogIndex < rf.lastLogIndex() {
+		if rf.lastLogIndex() > 0 && args.PrevLogIndex < rf.lastLogIndex() && args.PrevLogIndex > -1 {
 			rf.log = rf.log[:args.PrevLogIndex+1]
+			fmt.Println("匹配日志Index", args.PrevLogIndex)
 		}
 		for item := range args.Entries {
 			rf.log = append(rf.log, args.Entries[item])
 		}
-		if rf.lastLogIndex() < args.LeaderCommit {
-			rf.commitIndex = rf.lastLogIndex()
-		} else {
-			rf.commitIndex = args.LeaderCommit
-		}
 	}
-	fmt.Println(time.Now(), rf.me, "收到来自", args.LeaderId, "的心跳，当前/请求任期", rf.currentTerm, args.Term, "当前记录已同步,日志长度", len(rf.log), rf.log)
+	if rf.lastLogIndex() < args.LeaderCommit {
+		rf.commitIndex = rf.lastLogIndex()
+	} else {
+		rf.commitIndex = args.LeaderCommit
+	}
+	fmt.Println(time.Now(), rf.me, "收到来自", args.LeaderId, "的心跳，当前/请求任期", rf.currentTerm, args.Term, "当前记录已同步,日志长度", len(rf.log), args.PrevLogIndex+1)
 	reply.Term = rf.currentTerm
 }
 
@@ -333,9 +340,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		rf.log = append(rf.log, logEntry{TermId: term, Command: command})
 		rf.mu.Unlock()
-		fmt.Println("日志+", len(rf.log), command)
+		fmt.Println("日志+", rf.me, "长度", len(rf.log), command)
 		time.Sleep(time.Millisecond * 300)
-		return index, term, isLeader
+		return rf.lastLogIndex() + 1, term, isLeader
 	}
 
 }
@@ -383,9 +390,9 @@ func (rf *Raft) startElection() {
 	//竞选任期号为当前任期+1
 	//投票给自己
 	//重置计时器
-	fmt.Println(time.Now(), rf.me, "发起选举")
 	rf.mu.Lock()
 	rf.currentTerm++
+	fmt.Println(time.Now(), rf.me, "发起选举，任期", rf.currentTerm)
 	rf.voteFor = rf.me
 	rf.electionTimer.Reset(randomElectionTimeOut())
 	args := RequestVoteArgs{CandidateId: rf.me, Term: rf.currentTerm, LastLogIndex: rf.lastLogIndex()}
@@ -418,7 +425,7 @@ func (rf *Raft) startElection() {
 			}
 			rf.mu.Unlock()
 			voteGrantedNum++
-			fmt.Println(rf.me, "当选,任期号:获得选票数", voteGrantedNum)
+			fmt.Println(rf.me, "获得选票数", voteGrantedNum)
 			if voteGrantedNum > len(rf.peers)/2 && rf.state == CANDIDATE {
 				rf.state = LEADER
 				fmt.Println(rf.me, "当选,任期号:", rf.currentTerm)
@@ -429,7 +436,6 @@ func (rf *Raft) startElection() {
 					rf.nextIndex[i] = rf.lastLogIndex() + 1
 					rf.matchIndex[i] = -1
 				}
-				fmt.Println(rf.nextIndex)
 				rf.mu.Unlock()
 				rf.startHeartbeat()
 			}
@@ -458,31 +464,42 @@ func (rf *Raft) startHeartbeat() {
 				//等待信号唤醒
 				c.Wait()
 				rf.mu.Lock()
-				fmt.Println(rf.nextIndex)
+				fmt.Println(rf.me, "向", i, "发送心跳、nextIndex", rf.nextIndex)
 				term := rf.currentTerm
 				args := AppendEntryArgs{LeaderId: rf.me, Term: term}
 				args.LeaderCommit = rf.commitIndex
-				args.PrevLogIndex = rf.matchIndex[i]
-				fmt.Println("已同步位置", i, args.PrevLogIndex)
-				if args.PrevLogIndex >= 0 && len(rf.log) > args.PrevLogIndex {
+				args.PrevLogIndex = rf.nextIndex[i] - 1
+				fmt.Println(rf.me, "已同步位置", i, args.PrevLogIndex, "已提交", rf.commitIndex)
+				if args.PrevLogIndex >= 0 {
 					args.PrevLogTerm = rf.log[args.PrevLogIndex].TermId
 				}
 				if len(rf.log) > 0 && len(rf.log)-1 >= rf.nextIndex[i] {
 					args.Entries = rf.log[rf.nextIndex[i] : rf.nextIndex[i]+1]
-					fmt.Println("args.entrys", i, args.Entries[0])
+					// fmt.Println("args.entrys", i, args.Entries[0])
 				}
 				rf.mu.Unlock()
 				reply := AppendEntryReply{}
 				go func() {
 					fmt.Println("节点", rf.me, "发送心跳给", i)
-					if ok := rf.sendAppendEntriese(i, &args, &reply); !ok {
+					rf.sendAppendEntriese(i, &args, &reply)
+					if ok := reply.Success; !ok && rf.nextIndex[i] > 0 {
 						rf.nextIndex[i]--
-					} else {
-						if len(args.Entries) > 0 {
-							rf.matchIndex[i] = rf.nextIndex[i]
-							rf.nextIndex[i]++
-							fmt.Println("match index", rf.matchIndex[i])
+					} else if len(args.Entries) > 0 && reply.Success {
+						rf.matchIndex[i] = rf.nextIndex[i]
+						rf.nextIndex[i]++
+						rf.mu.Lock()
+						countSuc := 0
+						for j := 0; j < len(rf.peers); j++ {
+							if rf.matchIndex[j] >= rf.matchIndex[i] || rf.me == j {
+								countSuc++
+							}
 						}
+						if countSuc > (len(rf.peers))/2 && rf.commitIndex < rf.matchIndex[i] {
+							rf.commitIndex = rf.matchIndex[i]
+							fmt.Println(rf.me, "日志已提交", rf.commitIndex)
+						}
+						rf.mu.Unlock()
+						// fmt.Println("match index", rf.matchIndex[i])
 					}
 					if reply.Term > term {
 						rf.mu.Lock()
@@ -511,7 +528,6 @@ func (rf *Raft) startHeartbeat() {
 		}
 		c.L.Lock()
 		c.Broadcast()
-		fmt.Println("broadcast")
 		c.L.Unlock()
 	}
 	fmt.Println("心跳发送异常")
@@ -542,6 +558,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	// rf.readPersist(persister.ReadRaftState())
 	rf.voteFor = -1
+	rf.commitIndex = -1
 	// if rf.me != 0 {
 	// 	// rf.electionTimer.Stop()
 	// 	rf.electionTimer = *time.NewTimer(time.Hour)
