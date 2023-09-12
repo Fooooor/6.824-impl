@@ -199,13 +199,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Println("节点", rf.me, "收到来自", args.CandidateId, "的投票请求，当前/请求任期", rf.currentTerm, args.Term)
-	if args.Term < rf.currentTerm || args.LastLogIndex < rf.lastLogIndex() {
+	lstTerm := -1
+	if rf.lastLogIndex() >= 0 {
+		lstTerm = rf.log[rf.lastLogIndex()].TermId
+	}
+	fmt.Println("节点", rf.me, "收到来自", args.CandidateId, "的投票请求，当前/请求任期", rf.currentTerm, args.Term, args.LastLogTerm)
+	if args.Term < rf.currentTerm ||
+		(args.LastLogTerm < lstTerm ||
+			args.LastLogTerm == lstTerm && args.LastLogIndex < rf.lastLogIndex()) {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		fmt.Println(rf.me, "requestVote false 请求任期小于当前任期", "logtermId", args.LastLogTerm, rf.log[rf.lastLogIndex()].TermId)
 		return
 	}
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.currentTerm && (args.LastLogTerm > lstTerm || args.LastLogTerm == lstTerm && args.LastLogIndex >= rf.lastLogIndex()) {
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
 		rf.state = FOLLOWER
@@ -213,6 +220,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.voteFor != -1 && rf.voteFor != args.CandidateId {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		fmt.Println(rf.me, "已投票给", rf.voteFor)
 		return
 	}
 	rf.voteFor = args.CandidateId
@@ -231,6 +239,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		fmt.Println(rf.me, "当前任期大于请求任期，忽略请求")
 		return
 	}
+	rf.electionTimer.Reset(randomElectionTimeOut())
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = FOLLOWER
@@ -239,9 +248,28 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	if args.PrevLogIndex > rf.lastLogIndex() || args.PrevLogIndex > -1 && rf.log[args.PrevLogIndex].TermId != args.PrevLogTerm {
 		reply.Success = false
+		reply.Term = rf.currentTerm
 		fmt.Println("日志不匹配")
+	} else {
+		reply.Success = true
+		if len(args.Entries) > 0 {
+			//不匹配的日志需要被删除
+			if rf.lastLogIndex() > 0 && args.PrevLogIndex < rf.lastLogIndex() && args.PrevLogIndex > -1 {
+				rf.log = rf.log[:args.PrevLogIndex+1]
+				fmt.Println("匹配日志Index", args.PrevLogIndex)
+			}
+			for item := range args.Entries {
+				rf.log = append(rf.log, args.Entries[item])
+			}
+		}
+		if rf.lastLogIndex() < args.LeaderCommit {
+			rf.commitIndex = rf.lastLogIndex()
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+		fmt.Println(time.Now(), rf.me, "收到来自", args.LeaderId, "的心跳，当前/请求任期", rf.currentTerm, args.Term, "当前记录已同步,日志长度", len(rf.log), args.PrevLogIndex+1)
+		reply.Term = rf.currentTerm
 	}
-	rf.electionTimer.Reset(randomElectionTimeOut())
 	// var prevLogTerm int
 	// if len(rf.log) > 0 && args.PrevLogIndex > -1 {
 	// 	prevLogTerm = rf.log[args.PrevLogIndex].TermId
@@ -252,24 +280,6 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// 	}
 	// }
 	//将收到的消息的日志写入自身
-	reply.Success = true
-	if len(args.Entries) > 0 {
-		//不匹配的日志需要被删除
-		if rf.lastLogIndex() > 0 && args.PrevLogIndex < rf.lastLogIndex() && args.PrevLogIndex > -1 {
-			rf.log = rf.log[:args.PrevLogIndex+1]
-			fmt.Println("匹配日志Index", args.PrevLogIndex)
-		}
-		for item := range args.Entries {
-			rf.log = append(rf.log, args.Entries[item])
-		}
-	}
-	if rf.lastLogIndex() < args.LeaderCommit {
-		rf.commitIndex = rf.lastLogIndex()
-	} else {
-		rf.commitIndex = args.LeaderCommit
-	}
-	fmt.Println(time.Now(), rf.me, "收到来自", args.LeaderId, "的心跳，当前/请求任期", rf.currentTerm, args.Term, "当前记录已同步,日志长度", len(rf.log), args.PrevLogIndex+1)
-	reply.Term = rf.currentTerm
 }
 
 func randomElectionTimeOut() time.Duration {
@@ -336,12 +346,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	} else {
 		rf.mu.Lock()
+		defer rf.mu.Unlock()
 		index = rf.lastLogIndex()
 		term = rf.currentTerm
 		rf.log = append(rf.log, logEntry{TermId: term, Command: command})
-		rf.mu.Unlock()
 		fmt.Println("日志+", rf.me, "长度", len(rf.log), command)
-		time.Sleep(time.Millisecond * 300)
 		return rf.lastLogIndex() + 1, term, isLeader
 	}
 
@@ -395,8 +404,8 @@ func (rf *Raft) startElection() {
 	fmt.Println(time.Now(), rf.me, "发起选举，任期", rf.currentTerm)
 	rf.voteFor = rf.me
 	rf.electionTimer.Reset(randomElectionTimeOut())
-	args := RequestVoteArgs{CandidateId: rf.me, Term: rf.currentTerm, LastLogIndex: rf.lastLogIndex()}
-	if rf.lastLogIndex() > 0 {
+	args := RequestVoteArgs{CandidateId: rf.me, Term: rf.currentTerm, LastLogIndex: rf.lastLogIndex(), LastLogTerm: -1}
+	if rf.lastLogIndex() >= 0 {
 		args.LastLogTerm = rf.log[rf.lastLogIndex()].TermId
 	}
 	rf.mu.Unlock()
@@ -415,15 +424,16 @@ func (rf *Raft) startElection() {
 			fmt.Println("候选人：", rf.me, "投票人：", i)
 			rf.sendRequestVote(i, &args, &reply)
 			if granted := reply.VoteGranted; !granted {
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.state = "FOLLOWER"
+					rf.voteFor = -1
+				}
+				rf.mu.Unlock()
 				return
 			}
-			rf.mu.Lock()
-			if reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				rf.state = "FOLLOWER"
-				rf.voteFor = -1
-			}
-			rf.mu.Unlock()
+
 			voteGrantedNum++
 			fmt.Println(rf.me, "获得选票数", voteGrantedNum)
 			if voteGrantedNum > len(rf.peers)/2 && rf.state == CANDIDATE {
@@ -436,6 +446,7 @@ func (rf *Raft) startElection() {
 					rf.nextIndex[i] = rf.lastLogIndex() + 1
 					rf.matchIndex[i] = -1
 				}
+				fmt.Println("leader nextIndex重置", rf.nextIndex)
 				rf.mu.Unlock()
 				rf.startHeartbeat()
 			}
@@ -480,21 +491,24 @@ func (rf *Raft) startHeartbeat() {
 				rf.mu.Unlock()
 				reply := AppendEntryReply{}
 				go func() {
-					fmt.Println("节点", rf.me, "发送心跳给", i)
 					rf.sendAppendEntriese(i, &args, &reply)
+					if reply.Term == 0 {
+						return
+					}
+					fmt.Println("节点", rf.me, "发送心跳给", i, reply)
 					if ok := reply.Success; !ok && rf.nextIndex[i] > 0 {
 						rf.nextIndex[i]--
 					} else if len(args.Entries) > 0 && reply.Success {
 						rf.matchIndex[i] = rf.nextIndex[i]
 						rf.nextIndex[i]++
 						rf.mu.Lock()
-						countSuc := 0
+						countSuc := 1
 						for j := 0; j < len(rf.peers); j++ {
-							if rf.matchIndex[j] >= rf.matchIndex[i] || rf.me == j {
+							if rf.matchIndex[j] >= rf.matchIndex[i] {
 								countSuc++
 							}
 						}
-						if countSuc > (len(rf.peers))/2 && rf.commitIndex < rf.matchIndex[i] {
+						if countSuc > len(rf.peers)/2 && rf.commitIndex < rf.matchIndex[i] {
 							rf.commitIndex = rf.matchIndex[i]
 							fmt.Println(rf.me, "日志已提交", rf.commitIndex)
 						}
